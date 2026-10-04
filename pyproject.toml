@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text-sanitizer-core"
+dynamic = ["version"]
+description = "Engine and country-independent rules for masking PII and secrets in free text; regions plug in."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+keywords = ["pii", "sanitizer", "masking", "secrets", "redaction"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Intended Audience :: Developers",
+]
+
+[project.optional-dependencies]
+# Person names: spaCy only. Each region pins its own language model.
+ner = ["spacy>=3.8,<3.9"]
+
+[tool.setuptools.dynamic]
+version = { attr = "text_sanitizer_core.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
