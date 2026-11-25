@@ -15,11 +15,22 @@ from dataclasses import dataclass, field
 
 from . import ner as _ner
 
-_SECRET_WORDS = r"pass(?:word)?|senha|pwd|token|secret|segredo|api[_-]?key|apikey|auth(?:orization)?|cookie|session(?:_?id)?|sid"
+_SECRET_WORDS = (r"pass(?:word|wd)?|senha|pwd|pw|token|secret|segredo|api[_\s-]?key|apikey|auth(?:orization)?|cookie"
+                 r"|sess(?:ion)?(?:_?id)?|sid|credentials?|credencia(?:l|is)|chave|t?otp")
+# As a key, the secret word may close a longer name: APP_SID, PHPSESSID, APP_TOKEN, db.password.
+_SECRET_KEY = r"[A-Za-z0-9_.-]*?(?:" + _SECRET_WORDS + r")(?:[_.-]?(?:hash|digest|salt))?"
+# Characters of a loose password token (no path, URL, placeholder or quote characters).
+_PW = r"[^\s/:<>\"'(),;=]"
+# Words that tie the keyword to its value in free text: "a senha é x", "the password is x".
+_LINK_WORDS = r"é|eh|era|foi|fica|ficou|is|was"
+# Values that say "no secret here": masking them only hides the diagnosis.
+_FILE_EXT = (r"ya?ml|json|xml|js|ts|py|php|sql|html?|css|md|txt|log|ini|conf|env|lock|csv|sh|jar|plugin|gradle"
+             r"|toml|cfg|go|rb|java|kt|vue|tsx|jsx|zip|gz|tar|pdf|png|jpe?g")
+_EMPTY = r"(?!(?:null|none|nil|ok|true|false|undefined)\b)"
 
 # Tokens with a well-known prefix: masked even when they would not trip the entropy check.
 _KNOWN_TOKENS = (r"xox[abposr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-                 r"|sk-(?:ant-)?[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{35}")
+                 r"|sk-(?:ant-)?[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{16,}")
 
 
 def _luhn(digits: str) -> bool:
@@ -28,6 +39,39 @@ def _luhn(digits: str) -> bool:
         n = int(d) * (2 if i % 2 else 1)
         total += n - 9 if n > 9 else n
     return total % 10 == 0
+
+
+def _vin(m: re.Match) -> str:
+    """Vehicle identification number (17 chars, no I/O/Q): masked only when it mixes letters and digits."""
+    t = m.group(0)
+    return "<VIN>" if re.search(r"\d", t) and re.search(r"[A-Za-z]", t) else t
+
+
+def _ipv6(m: re.Match) -> str:
+    """Compressed IPv6 ("2001:db8::1", "::1"): needs a digit, so C++/PHP scopes (Db::add) survive."""
+    return "<IP>" if re.search(r"\d", m.group(0)) else m.group(0)
+
+
+def _secret_word(m: re.Match) -> str:
+    """Free-text secret. A bare number after filler words is a metric ("token expira em 3600"), not a secret;
+    right after the keyword it is one ("totp 482913")."""
+    if m.group("f") and m.group("v").isdigit():
+        return m.group(0)
+    return f"{m.group('k')}{m.group('f')} <SECRET>"
+
+
+def id_after_words(words: str) -> tuple:
+    """Short number right after a word that names an entity ("user 4521", "pedido nº 98765", "loja #312")."""
+    return ("id_word", r"(?i)\b(?P<w>(?:" + words + r")s?)(?P<sep>\s*(?:n[º°o]\.?|#|:|=|/)?\s*)#?\d{1,5}\b",
+            r"\g<w>\g<sep><ID>")
+
+
+def login_after_words(words: str) -> tuple:
+    """Login right after a word that names it ("login=fsilva", "usuario: fulano.silva").
+    The value must start with a letter (a number is an ID, handled elsewhere)."""
+    return ("login_word", r"(?i)\b(?P<w>(?:" + words + r"))(?P<sep>\s*[:=]\s*[\"']?)" + _EMPTY
+            + r"(?!(?:inv[aá]lid[oa]|invalid|vazio|empty|desconhecid[oa]|unknown|n[aã]o|not)\b)"
+            r"[A-Za-z][\w.@-]*", r"\g<w>\g<sep><USER>")
 
 
 def _card(m: re.Match) -> str:
@@ -41,30 +85,78 @@ def _card(m: re.Match) -> str:
 CORE_MASKS_BEFORE: list[tuple] = [
     ("private_key", r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "<PRIVATE_KEY>"),
     ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b", "<JWT>"),
+    # Whole Authorization header, whatever the scheme (Basic, Token, Bearer, custom).
+    ("auth_header", r"(?im)\b(?P<k>(?:proxy-)?authorization\s*:\s*)[^\n'\"]+", r"\g<k><SECRET>"),
+    # Credentials on a command line: curl -u user:pass, mysql -pPASS (attached, as the client requires).
+    ("cli_user", r"(?P<k>(?:^|\s)(?:-u|--user)\s+)[^\s:'\"]+:[^\s'\"]+", r"\g<k><USERINFO>"),
+    ("cli_mysql_p", r"(?i)(?P<k>\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\n]*?\s-p)(?!\s)[^\s'\"]+", r"\g<k><SECRET>"),
+    # Token in a URL path: /reset/token/<value>, /verify/<value>.
+    ("path_token", r"(?i)(?P<k>/(?:[\w-]*token|reset|verify|confirm|activate|invite|magic[\w-]*)/)(?=[A-Za-z0-9_-]*\d)"
+                   r"[A-Za-z0-9_-]{8,}", r"\g<k><TOKEN>"),
     ("bearer", r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer <TOKEN>"),
+    ("auth_scheme", r"(?i)\b(?P<s>basic|digest|negotiate|ntlm)\s+[A-Za-z0-9+/=._-]{6,}", r"\g<s> <TOKEN>"),
+    ("password_hash", r"\$(?:2[abxy]?|argon2(?:id|i|d)|[156])\$[^\s\"']{8,}", "<HASH>"),
     ("known_token", r"\b(?:" + _KNOWN_TOKENS + r")", "<TOKEN>"),
     # Before regional documents and long_number, which would otherwise take pieces of the number.
     ("card", r"(?<![\d.])\d(?:[ -]?\d){12,18}(?![\d.])", _card),
+    # Dotted groups of four ("4111.1111.1111.1111"); dots stay out of the rule above for metrics like 51.000.000.
+    ("card_dotted", r"(?<![\d.])\d{4}(?:\.\d{4}){2,3}(?:\.\d{1,3})?(?![\d.])", _card),
+    ("card_cvv", r"(?i)\b(?P<k>cvv2?|cvc2?|cid)\s*[:=]?\s*\d{3,4}\b", r"\g<k> <CVV>"),
+    ("card_expiry", r"(?i)\b(?P<k>exp(?:iry|ires|iration)?|valid(?:ity|ade)?|venc(?:imento)?)\s*[:=]?\s*"
+                    r"(?:0[1-9]|1[0-2])\s*/\s*(?:\d{2}|\d{4})\b", r"\g<k> <EXPIRY>"),
+    ("vin", r"(?i)\b[A-HJ-NPR-Z0-9]{17}\b", _vin),
     # URL userinfo (scheme://user:pass@host) before anything else sees the "@".
     ("url_userinfo", r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#@]+@", r"\1<USERINFO>@"),
+    # Whole cookie header: every pair in it is session state.
+    ("cookie_header", r"(?im)\b(?P<k>(?:set-)?cookie\s*:\s*)[^\n]+", r"\g<k><SECRET>"),
     # key=value, key: value, and quoted keys as in JSON ("password": "x").
-    ("secret_kv", r"(?i)\b(?P<k>" + _SECRET_WORDS + r")\b(?P<sep>[\"']?\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;&}]+)",
+    ("secret_kv", r"(?i)\b(?P<k>" + _SECRET_KEY + r")\b(?P<sep>[\"']?\s*[=:]\s*)" + _EMPTY + r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&}]+)",
      r"\g<k>\g<sep><SECRET>"),
     # Free text ("a senha é hunter2"): skip up to 3 short words, mask the first token with a digit.
-    ("secret_word", r"(?i)\b(?P<k>" + _SECRET_WORDS + r")\b(?P<f>(?:\s+[^\W\d_]{1,7}){0,3}?)\s+(?=[^\s,;&]*\d)[^\s,;&]{4,}",
-     r"\g<k>\g<f> <SECRET>"),
+    # Composite key, space, value: "APP_SID abc123def", "APP_TOKEN x9y8z7w6".
+    ("secret_key_space", r"(?i)\b(?P<k>[A-Za-z0-9]+[_.-](?:[A-Za-z0-9]+[_.-])*?(?:sid|sessid|session_?id|token|secret|key"
+                         r"|pass(?:word|wd)?))\s+[^\s,;&<]{6,}", r"\g<k> <SECRET>"),
+    ("secret_word", r"(?i)\b(?P<k>" + _SECRET_KEY + r")\b(?P<f>(?:\s+[^\W\d_]{1,7}){0,3}?)\s+(?=[^\s,;&]*\d)(?P<v>[^\s,;&]{4,})",
+     _secret_word),
+    # "a senha é passarinhoazul": the link word makes the next token the value, digit or not.
+    ("secret_is", r"(?i)\b(?P<k>" + _SECRET_WORDS + r")(?P<f>(?:\s+[^\W\d_]{1,7}){0,3}?)(?P<l>\s+(?:" + _LINK_WORDS
+     + r")\s+|\s*[=:]\s*)" + _EMPTY + r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&<]{3,})", r"\g<k>\g<f>\g<l><SECRET>"),
+    # Loose password with no keyword: upper, lower, digit and symbol in one 8-64 char token.
+    ("password_like", r"(?<![^\s\"'(])(?=" + _PW + r"*[a-z])(?=" + _PW + r"*[A-Z])(?=" + _PW + r"*\d)"
+                      r"(?=" + _PW + r"*[!@#$%^&*?~+])" + _PW + r"{8,64}(?![^\s\"',;)])", "<SECRET>"),
     ("url_query", r"(https?://[^\s?#]+)\?[^\s#]*", r"\1?<QUERY>"),
     ("email", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "<EMAIL>"),
+    # Written to dodge filters: fulano%40x.com, fulano[at]x.com, fulano (arroba) x (ponto) com.
+    ("email_obfuscated", r"(?i)\b[A-Za-z0-9._+%-]+(?:%40|\s*[\[({]\s*(?:at|arroba)\s*[\])}]\s*)[A-Za-z0-9-]+"
+                         r"(?:(?:\.|%2e|\s*[\[({]\s*(?:dot|ponto)\s*[\])}]\s*)[A-Za-z0-9-]+)+", "<EMAIL>"),
+    # Spelled out without brackets ("fulano.silva at example dot com"): needs "at" and a known TLD after "dot".
+    ("email_spelled", r"(?i)\b[A-Za-z0-9._+-]+\s+(?:at|arroba)\s+[A-Za-z0-9-]+(?:\s+(?:dot|ponto)\s+[A-Za-z0-9-]+)*"
+                      r"\s+(?:dot|ponto)\s+(?:com|net|org|br|io|gov|edu|co|info|dev|app|pt|es|us|uk)\b", "<EMAIL>"),
+    # No TLD ("fulano.silva@intranet"): local part with a dot or underscore; package tags and digests stay.
+    ("email_no_tld", r"(?<![\w@/.-])[A-Za-z][A-Za-z+-]*[._][A-Za-z][A-Za-z0-9._+-]*@(?!(?:latest|next|beta|alpha|canary|rc|stable"
+                     r"|sha\d+|v?\d)\b)[A-Za-z][A-Za-z0-9-]*\b(?![.@:/])", "<EMAIL>"),
 ]
 
 CORE_MASKS_AFTER: list[tuple] = [
     ("uuid", r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "<UUID>"),
     ("ipv4", r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<IP>"),
+    # IP written with dashes inside a hostname ("203-0-113-45.example.net", "ip-10-0-0-5.ec2.internal").
+    ("ipv4_dashed", r"(?i)(?:\bip-|\b)(?:\d{1,3}-){3}\d{1,3}(?=\.[a-z])(?!\.(?:" + _FILE_EXT + r"|release)\b)", "<IP>"),
     ("ipv6", r"\b(?:[0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}\b", "<IP>"),
+    ("ipv6_short", r"(?<![\w:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?(?![\w:])",
+     _ipv6),
     ("long_hex", r"\b[0-9a-fA-F]{32,}\b", "<HEX>"),
+    login_after_words(r"user(?:_?name)?|login|author"),
+    # @first.last handle; decorators ("@app.route(", "@pytest.mark.x", "@login_required") are left alone.
+    ("handle", r"(?<![\w.@])@(?!(?:app|self|pytest|router|bot|client|api|celery|bp|blueprint|dp)\.)"
+               r"[a-z][a-z0-9]*\.[a-z0-9]+(?![\w.(/-])", "@<USER>"),
+    ("handle_by", r"\b(?P<w>(?i:by|por|author|autor)\s+)[a-z]{2,}[._](?!(?:" + _FILE_EXT + r")\b)[a-z]{2,}\b(?![.(/])",
+     r"\g<w><USER>"),
+    id_after_words(r"user|customer|client|account|order|store|seller|buyer|ticket"),
     # 6+ digit number without separators: treated as an identifier (raw document, card, account id).
     ("long_number", r"(?<![\d.,])\d{6,}(?![\d.,])", "<N>"),
-    ("id_kv", r"(?i)\b(id(_[a-z]+)?|[a-z]+_id)\s*[=:]\s*\d+", r"\1=<N>"),
+    ("id_kv", r"(?P<k>\b(?i:u?id(?:_[a-z]+)?|[a-z]+_id|cod_[a-z]+)|\b[a-z]+Id)(?P<sep>[\"']?\s*[=:]?\s*)\d+",
+     r"\g<k>\g<sep><N>"),
 ]
 
 # Detectors that BLOCK even after masking (cannot be masked safely).
@@ -73,6 +165,7 @@ DEFAULT_BLOCKS: list[tuple[str, str]] = [
     ("gcp_key", r"(?i)\"?private_key(_id)?\"?\s*:"),
     ("pem_header", r"-----BEGIN [A-Z ]*(PRIVATE KEY|CERTIFICATE)-----"),
     ("residual_at", r"[^\s>]@\S+\.\S"),  # ">@" is a mask placeholder (<USERINFO>@host)
+    ("residual_at_encoded", r"(?i)[^\s>]%40\S+\.\S"),
     ("conn_string", r"(?i)\b(mysql|postgres(ql)?|mongodb(\+srv)?|redis|amqp|mssql|jdbc:[a-z]+)://"),
 ]
 
@@ -107,8 +200,10 @@ class Sanitizer:
 
     def __init__(self, region_masks=(), extra_masks=(), extra_blocks=(), max_chars: int = 20000,
                  entropy_threshold: float = 4.0, ner_models=()):
-        rules = [*CORE_MASKS_BEFORE, *region_masks, *CORE_MASKS_AFTER, *extra_masks]
-        self.masks = [(n, re.compile(p), r) for n, p, r in rules]
+        # Secrets and e-mail run BEFORE the name model: it may tag the keyword itself ("Cookie" -> <PERSON>)
+        # and the value would then lose its anchor. Everything else runs after it, on the original wording.
+        self.pre_masks = [(n, re.compile(p), r) for n, p, r in CORE_MASKS_BEFORE]
+        self.masks = [(n, re.compile(p), r) for n, p, r in [*region_masks, *CORE_MASKS_AFTER, *extra_masks]]
         self.blocks = [(n, re.compile(p)) for n, p in [*DEFAULT_BLOCKS, *extra_blocks]]
         self.max_chars = max_chars
         self.entropy_threshold = entropy_threshold
@@ -127,6 +222,14 @@ class Sanitizer:
                 return True
         return False
 
+    @staticmethod
+    def _apply(rules, text: str, report: Report) -> str:
+        for name, rx, repl in rules:
+            text, n = rx.subn(repl, text)
+            if n:
+                report.masks[name] = report.masks.get(name, 0) + n
+        return text
+
     def sanitize(self, text) -> tuple[str, Report]:
         report = Report()
         if not isinstance(text, str):
@@ -139,15 +242,12 @@ class Sanitizer:
         if self._ner_error:
             report.blocked.append(self._ner_error)
             return "", report
-        clean = text
-        for nlp in self._nlps:  # names first, on the original text the models were trained on
+        clean = self._apply(self.pre_masks, text, report)
+        for nlp in self._nlps:
             clean, n = _ner.mask_persons(nlp, clean)
             if n:
                 report.masks["person"] = report.masks.get("person", 0) + n
-        for name, rx, repl in self.masks:
-            clean, n = rx.subn(repl, clean)
-            if n:
-                report.masks[name] = report.masks.get(name, 0) + n
+        clean = self._apply(self.masks, clean, report)
         report.blocked += [name for name, rx in self.blocks if rx.search(clean)]
         if self._high_entropy(clean):
             report.blocked.append("high_entropy")
