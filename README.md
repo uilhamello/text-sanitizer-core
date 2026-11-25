@@ -27,8 +27,15 @@ clean, report = s.sanitize(texto)    # report.masks (dict), report.blocked (list
 
 | Ação | Alvo |
 |---|---|
-| **Mascara** | e-mail, cartão (Luhn), IP, UUID, JWT, `Bearer`, tokens com prefixo conhecido (Slack, GitHub, Anthropic/OpenAI, Stripe, Google), `senha=`/`token=` (também em JSON e texto corrido), credencial e query string em URL, hex longo, número de 6+ dígitos, `*_id=`; nomes de pessoas com o modelo da região |
+| **Mascara** | e-mail (também ofuscado: `[at]`, `%40`, "fulano at example dot com", sem TLD como `nome.sobrenome@intranet`), cartão (Luhn), IP, UUID, JWT, `Bearer`, tokens com prefixo conhecido (Slack, GitHub, Anthropic/OpenAI, Stripe, Google), `senha=`/`token=` (também em JSON e texto corrido), credencial e query string em URL, hex longo, IP com hífen em hostname (`ip-10-0-0-5.ec2.internal`), número de 6+ dígitos, `*_id=`/`userId=`/`uid=`, login (`login=`, `username:`, `@first.last`); nomes de pessoas com o modelo da região |
 | **Bloqueia** | chave AWS, chave de service account GCP, PEM, connection string, string de alta entropia, `@` residual, texto acima de `max_chars`, região ou modelo de nomes ausente |
+
+## Limites
+
+- E-mail por extenso só é pego com TLD conhecido depois de "dot" (com, br, net, org, io...).
+  Efeito colateral aceito: "look at this dot com" vira `<EMAIL>`.
+- E-mail sem TLD exige ponto ou sublinhado no usuário (`nome.sobrenome@host`); `root@localhost` passa.
+- Regex não substitui minimização: não leve o dado pessoal se não precisar dele.
 
 ## Escrever uma região
 
