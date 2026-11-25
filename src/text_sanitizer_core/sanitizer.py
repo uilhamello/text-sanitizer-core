@@ -201,9 +201,11 @@ class Sanitizer:
     def __init__(self, region_masks=(), extra_masks=(), extra_blocks=(), max_chars: int = 20000,
                  entropy_threshold: float = 4.0, ner_models=()):
         # Secrets and e-mail run BEFORE the name model: it may tag the keyword itself ("Cookie" -> <PERSON>)
-        # and the value would then lose its anchor. Everything else runs after it, on the original wording.
-        self.pre_masks = [(n, re.compile(p), r) for n, p, r in CORE_MASKS_BEFORE]
-        self.masks = [(n, re.compile(p), r) for n, p, r in [*region_masks, *CORE_MASKS_AFTER, *extra_masks]]
+        # and the value would then lose its anchor. The caller's rules come right after the secrets, so they win
+        # over the generic ones ("TCK-4521" is a ticket, not a plate) without unanchoring a password.
+        # Everything else runs after the name model, on the original wording.
+        self.pre_masks = [(n, re.compile(p), r) for n, p, r in [*CORE_MASKS_BEFORE, *extra_masks]]
+        self.masks = [(n, re.compile(p), r) for n, p, r in [*region_masks, *CORE_MASKS_AFTER]]
         self.blocks = [(n, re.compile(p)) for n, p in [*DEFAULT_BLOCKS, *extra_blocks]]
         self.max_chars = max_chars
         self.entropy_threshold = entropy_threshold

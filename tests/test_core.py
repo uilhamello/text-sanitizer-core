@@ -140,6 +140,19 @@ class Leaks(unittest.TestCase):
                 self.assertEqual(sanitize(text)[0], text)
 
 
+class ExtraMasks(unittest.TestCase):
+    def test_caller_rule_wins_over_generic(self):
+        """A caller rule must not lose to a generic one: "TCK-4521" is a ticket, not an ID or a plate."""
+        s = Sanitizer(region_masks=[("plate", r"\b[A-Z]{3}-\d{4}\b", "<PLATE>")],
+                      extra_masks=[("ticket", r"\bTCK-\d+\b", "<TICKET>")])
+        self.assertEqual(s.sanitize("TCK-4521 aberto")[0], "<TICKET> aberto")
+
+    def test_secret_still_masked_with_broad_caller_rule(self):
+        """A broad caller rule runs after the secrets, so it cannot strip the keyword before the value is masked."""
+        s = Sanitizer(extra_masks=[("palavra", r"\bsenha\b", "<X>")])
+        self.assertNotIn("batata123", s.sanitize("senha: batata123")[0])
+
+
 class Blocks(unittest.TestCase):
     CASES = [
         ("aws AKIAABCDEFGHIJKLMNOP", "aws_key"),
