@@ -189,6 +189,24 @@ class KeepsMetrics(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(sanitize(text)[0], text)
 
+    def test_secret_word_with_key_suffix_masked(self):
+        """SECRET_KEY, AUTH_KEY: the "_KEY" after the secret word used to break the match."""
+        cases = (
+            ("SECRET_KEY='django-insecure-fake0a1b2c3d'", "fake0a1b2c3d"),
+            ('SECRET_KEY = "fake-secret-0a1b2c"', "fake-secret-0a1b2c"),
+            ("export SECRET_KEY=fakeKeyValue123", "fakeKeyValue123"),
+            ("AUTH_KEY: fakeAuthKey987", "fakeAuthKey987"),
+            ("AWS_SECRET_ACCESS_KEY=fakeAwsSecret0123", "fakeAwsSecret0123"),
+        )
+        for text, value in cases:
+            with self.subTest(text=text):
+                self.assertNotIn(value, sanitize(text)[0])
+
+    def test_secret_word_with_config_suffix_untouched(self):
+        for text in ("token_ttl=3600", "password_min_length=8", "session_timeout: 1800", "cookie_lifetime=86400"):
+            with self.subTest(text=text):
+                self.assertEqual(sanitize(text)[0], text)
+
 
 class Regions(unittest.TestCase):
     def test_region_masks_run_between_core_before_and_after(self):
