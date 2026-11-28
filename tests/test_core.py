@@ -208,6 +208,42 @@ class KeepsMetrics(unittest.TestCase):
                 self.assertEqual(sanitize(text)[0], text)
 
 
+    def test_versions_hashes_and_sizes_untouched(self):
+        for text in ("epoch 1763618700 ms", "latência 1234567 µs", "Rows examined: 1234567", "Content-Length: 123456",
+                     "build 20261120 deploy release-20261120", "valor 123456789 centavos",
+                     "commit a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+                     "sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                     "Mozilla/5.0 AppleWebKit/537.36 Chrome/120.0.0.0", "versão 1.2.3.4 do pacote", "OID 1.3.6.1.4.1"):
+            with self.subTest(text=text):
+                clean, report = sanitize(text)
+                self.assertEqual(clean, text)
+                self.assertEqual(report.masks, {})  # a rule that keeps its match does not count it
+
+    def test_relaxed_rules_still_mask_lookalikes(self):
+        cases = (
+            ("md5 5f4dcc3b5aa765d61d8327deb882cf99", "5f4dcc3b5aa765d61d8327deb882cf99"),  # may be a password hash
+            ("acesso de origem/198.51.100.7", "198.51.100.7"),  # "/" after a plain word is a path, not a version
+            ("doc 12345678901 bytes", "12345678901"),  # 11 digits: a unit after it is not enough
+            ("fulano.silva @ example.com", "fulano.silva"),
+            ("fulano.silva\uff20example.com", "fulano.silva"),  # full-width "@"
+        )
+        for text, value in cases:
+            with self.subTest(text=text):
+                self.assertNotIn(value, sanitize(text)[0])
+
+
+class NameFilter(unittest.TestCase):
+    def test_technical_spans_are_not_names(self):
+        from text_sanitizer_core.ner import is_name
+        for span in ("Docker", "Kubernetes", "Maria DB", "Lock wait timeout exceeded", "Authorization header",
+                     "HTTP/1.1 200 OK", "Db::add", "sha256 e3b0c442", "ERRO SQLSTATE[HY000", "lock"):
+            with self.subTest(span=span):
+                self.assertFalse(is_name(span))
+        for span in ("Carlos Pereira", "CARLOS PEREIRA DE SOUZA", "joão pedro almeida", "<PERSON> Pereira", "M. Pereira"):
+            with self.subTest(span=span):
+                self.assertTrue(is_name(span))
+
+
 class Regions(unittest.TestCase):
     def test_region_masks_run_between_core_before_and_after(self):
         doc = ("doc", r"\bDOC-\d{6}\b", "<DOC>")

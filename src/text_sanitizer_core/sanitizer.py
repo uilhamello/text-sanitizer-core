@@ -55,6 +55,42 @@ def _ipv6(m: re.Match) -> str:
     return "<IP>" if re.search(r"\d", m.group(0)) else m.group(0)
 
 
+# A number or hash right after these words, or a number before a unit, is a metric, size, build or commit.
+_NUM_KEY = re.compile(r"(?i)(?:epoch|timestamp|rows[_ ]?(?:examined|sent|affected)|content-length|bytes|size|build"
+                      r"|release|vers[aã]o|version)\s*[:=#-]?\s*$")
+_NUM_UNIT = re.compile(r"(?i)\s*(?:ms|µs|us|ns|s|seg(?:undos?)?|min(?:utos?)?|bytes?|[kmg]b|centavos|rows|linhas"
+                       r"|registros)\b")
+_HEX_KEY = re.compile(r"(?i)(?:commit|sha\d*|checksum|etag|rev(?:ision)?)\s*[:=]?\s*$")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_IP_VERSION = re.compile(r"(?i)(?:\b(?:chrome|chromium|firefox|safari|edge?|opr|version|applewebkit|mozilla|gecko|crios"
+                         r"|curl|python|node|php|java|go|okhttp|dalvik)/|\bv|vers[aã]o\s*|version\s*)$")
+
+
+def _long_number(m: re.Match) -> str:
+    s, i, j = m.string, m.start(), m.end()
+    while i and s[i - 1] in _HEX_DIGITS:
+        i -= 1
+    while j < len(s) and s[j] in _HEX_DIGITS:
+        j += 1
+    if j - i >= 32:  # digits inside a hash that _long_hex kept (commit, checksum)
+        return m.group(0)
+    before, after = m.string[max(0, m.start() - 30):m.start()], m.string[m.end():m.end() + 12]
+    if _NUM_KEY.search(before):
+        return m.group(0)
+    # A unit alone is weak evidence: 11+ digits may be a document (CPF, RENAVAM, CNH) with a stray "bytes" after it.
+    return m.group(0) if len(m.group(0)) <= 10 and _NUM_UNIT.match(after) else "<N>"
+
+
+def _long_hex(m: re.Match) -> str:
+    """Hash after "commit" or "sha256" is a commit or checksum. After "hash" or "md5" it may be a password hash."""
+    return m.group(0) if _HEX_KEY.search(m.string[max(0, m.start() - 20):m.start()]) else "<HEX>"
+
+
+def _ipv4(m: re.Match) -> str:
+    """Four numbers with dots after a product name or "versão" ("Chrome/120.0.0.0", "versão 1.2.3.4") are a version."""
+    return m.group(0) if _IP_VERSION.search(m.string[max(0, m.start() - 12):m.start()]) else "<IP>"
+
+
 def _secret_word(m: re.Match) -> str:
     """Free-text secret. A bare number after filler words is a metric ("token expira em 3600"), not a secret;
     right after the keyword it is one ("totp 482913")."""
@@ -132,6 +168,10 @@ CORE_MASKS_BEFORE: list[tuple] = [
     # Written to dodge filters: fulano%40x.com, fulano[at]x.com, fulano (arroba) x (ponto) com.
     ("email_obfuscated", r"(?i)\b[A-Za-z0-9._+%-]+(?:%40|\s*[\[({]\s*(?:at|arroba)\s*[\])}]\s*)[A-Za-z0-9-]+"
                          r"(?:(?:\.|%2e|\s*[\[({]\s*(?:dot|ponto)\s*[\])}]\s*)[A-Za-z0-9-]+)+", "<EMAIL>"),
+    # "@" with spaces around it or in full width ("fulano @ example.com", "fulano＠example.com"): known TLD only,
+    # so code like "A @ B.T" (matrix product) stays.
+    ("email_spaced", r"(?i)\b[A-Za-z0-9._+%-]+(?:\s+@\s*|\s*@\s+|\s*[＠﹫]\s*)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
+                     r"\.(?:com|net|org|br|io|gov|edu|co|info|dev|app|pt|es|us|uk)\b", "<EMAIL>"),
     # Spelled out without brackets ("fulano.silva at example dot com"): needs "at" and a known TLD after "dot".
     ("email_spelled", r"(?i)\b[A-Za-z0-9._+-]+\s+(?:at|arroba)\s+[A-Za-z0-9-]+(?:\s+(?:dot|ponto)\s+[A-Za-z0-9-]+)*"
                       r"\s+(?:dot|ponto)\s+(?:com|net|org|br|io|gov|edu|co|info|dev|app|pt|es|us|uk)\b", "<EMAIL>"),
@@ -142,13 +182,14 @@ CORE_MASKS_BEFORE: list[tuple] = [
 
 CORE_MASKS_AFTER: list[tuple] = [
     ("uuid", r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "<UUID>"),
-    ("ipv4", r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<IP>"),
+    # Part of a longer dotted chain ("OID 1.3.6.1.4.1") is not an address.
+    ("ipv4", r"(?<!\d\.)\b(?:\d{1,3}\.){3}\d{1,3}\b(?!\.\d)", _ipv4),
     # IP written with dashes inside a hostname ("203-0-113-45.example.net", "ip-10-0-0-5.ec2.internal").
     ("ipv4_dashed", r"(?i)(?:\bip-|\b)(?:\d{1,3}-){3}\d{1,3}(?=\.[a-z])(?!\.(?:" + _FILE_EXT + r"|release)\b)", "<IP>"),
     ("ipv6", r"\b(?:[0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}\b", "<IP>"),
     ("ipv6_short", r"(?<![\w:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?(?![\w:])",
      _ipv6),
-    ("long_hex", r"\b[0-9a-fA-F]{32,}\b", "<HEX>"),
+    ("long_hex", r"\b[0-9a-fA-F]{32,}\b", _long_hex),
     login_after_words(r"user(?:_?name)?|login|author"),
     # @first.last handle; decorators ("@app.route(", "@pytest.mark.x", "@login_required") are left alone.
     ("handle", r"(?<![\w.@])@(?!(?:app|self|pytest|router|bot|client|api|celery|bp|blueprint|dp)\.)"
@@ -157,7 +198,7 @@ CORE_MASKS_AFTER: list[tuple] = [
      r"\g<w><USER>"),
     id_after_words(r"user|customer|client|account|order|store|seller|buyer|ticket"),
     # 6+ digit number without separators: treated as an identifier (raw document, card, account id).
-    ("long_number", r"(?<![\d.,])\d{6,}(?![\d.,])", "<N>"),
+    ("long_number", r"(?<![\d.,])\d{6,}(?![\d.,])", _long_number),
     ("id_kv", r"(?P<k>\b(?i:u?id(?:_[a-z]+)?|[a-z]+_id|cod_[a-z]+)|\b[a-z]+Id)(?P<sep>[\"']?\s*[=:]?\s*)\d+",
      r"\g<k>\g<sep><N>"),
 ]
@@ -230,7 +271,19 @@ class Sanitizer:
     @staticmethod
     def _apply(rules, text: str, report: Report) -> str:
         for name, rx, repl in rules:
-            text, n = rx.subn(repl, text)
+            if callable(repl):  # count only the matches the rule really changed (_card, _ipv4 may keep them)
+                changed = 0
+
+                def repl_counting(m, f=repl):
+                    nonlocal changed
+                    out = f(m)
+                    changed += out != m.group(0)
+                    return out
+
+                text = rx.sub(repl_counting, text)
+                n = changed
+            else:
+                text, n = rx.subn(repl, text)
             if n:
                 report.masks[name] = report.masks.get(name, 0) + n
         return text
