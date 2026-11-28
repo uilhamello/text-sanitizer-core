@@ -18,7 +18,10 @@ from . import ner as _ner
 _SECRET_WORDS = (r"pass(?:word|wd)?|senha|pwd|pw|token|secret|segredo|api[_\s-]?key|apikey|auth(?:orization)?|cookie"
                  r"|sess(?:ion)?(?:_?id)?|sid|credentials?|credencia(?:l|is)|chave|t?otp")
 # As a key, the secret word may close a longer name: APP_SID, PHPSESSID, APP_TOKEN, db.password.
-_SECRET_KEY = r"[A-Za-z0-9_.-]*?(?:" + _SECRET_WORDS + r")(?:[_.-]?(?:hash|digest|salt))?"
+# It may also be followed by a short, specific suffix: SECRET_KEY, AUTH_KEY, SECRET_ACCESS_KEY, secret_value.
+# Never a generic one: token_ttl, password_min_length and session_timeout are config, not secrets.
+_SECRET_KEY = (r"[A-Za-z0-9_.-]*?(?:" + _SECRET_WORDS + r")"
+               r"(?:[_.-]?(?:hash|digest|salt|(?:access[_.-]?)?key|value))?")
 # Characters of a loose password token (no path, URL, placeholder or quote characters).
 _PW = r"[^\s/:<>\"'(),;=]"
 # Words that tie the keyword to its value in free text: "a senha é x", "the password is x".
